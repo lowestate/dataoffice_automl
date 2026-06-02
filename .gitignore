@@ -1,0 +1,8 @@
+__pycache__
+venv
+catboost_info/
+*/__pycache__
+.env
+datasets
+clustering_report.txt
+*.md

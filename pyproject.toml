@@ -1,0 +1,6 @@
+[tool.vulture]
+exclude = ["catboost-info", "datasets", "venv", "__pycache__"]
+paths = ["."]
+
+# filtering by artefact type; Windows; inside root-folder:
+#       vulture . | Select-String "function|class|variable"
