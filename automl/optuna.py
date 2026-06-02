@@ -38,22 +38,24 @@ def compute_overlap_penalty(*, X: np.ndarray, labels: np.ndarray) -> float:
     unique_labels = np.unique(labels)
     if len(unique_labels) < 2: return 1.0
 
-    centroids = np.vstack([X[labels == lbl].mean(axis=0) for lbl in unique_labels])
-    dists = np.linalg.norm(X[:, None, :] - centroids[None, :, :], axis=2)
-    true_idx = np.array([np.where(unique_labels == lbl)[0][0] for lbl in labels])
-    nearest_idx = np.argmin(dists, axis=1)
-    misassigned_basic = np.mean(nearest_idx != true_idx)
+    n_samples = X.shape[0]
+    # Используем чуть большую окрестность для лучшей чувствительности к границам кластеров
+    k_neighbors = min(8, n_samples - 1)
+    if k_neighbors < 2:
+        return 1.0
 
-    max_intra, min_inter = [], []
-    for lbl in unique_labels:
-        points = X[labels == lbl]
-        others = X[labels != lbl]
-        max_intra.append(np.percentile(pairwise_distances(points), 90) if len(points) > 1 else 0.0)
-        min_inter.append(np.percentile(pairwise_distances(points, others), 5) if len(others) > 0 else np.inf)
-
-    merge_penalty = np.mean([min(1.0, intra / inter) for intra, inter in zip(max_intra, min_inter) if inter > 1e-6])
-    overlap_score = 1.0 - (0.5 * misassigned_basic + 0.5 * merge_penalty)
-    return float(np.clip(overlap_score, 0.0, 1.0))
+    try:
+        neigh = NearestNeighbors(n_neighbors=k_neighbors)
+        neigh.fit(X)
+        indices_any = cast(Any, neigh.kneighbors(X, return_distance=False))
+        neighbor_labels = cast(Any, labels)[indices_any[:, 1:]]
+        point_labels = labels[:, None]
+        
+        matches = (neighbor_labels == point_labels)
+        purity = np.mean(matches)
+        return float(purity) if not np.isnan(purity) else 1.0
+    except:
+        return 1.0
 
 def compute_centroid_separation(*, X, labels) -> float:
     unique = np.unique(labels[labels != -1])
@@ -66,7 +68,7 @@ def compute_centroid_separation(*, X, labels) -> float:
     if data_range == 0: return 0.0
     
     avg_dist = np.mean(dists[np.triu_indices(len(unique), k=1)])
-    return float(np.clip(avg_dist / data_range, 0, 1))
+    return float(np.clip(2.0 * avg_dist / data_range, 0.0, 1.0))
 
 def compute_unified_score(
     X: np.ndarray, labels: np.ndarray, *,
@@ -86,56 +88,88 @@ def compute_unified_score(
         return 0.0, {}
 
     max_cluster_ratio = np.max(counts) / np.sum(mask)
-    balance_penalty = 1.0
-    if max_cluster_ratio > 0.95: balance_penalty = 0.1
-    elif max_cluster_ratio > 0.85: balance_penalty = 0.5
+    balance_penalty = 1.0 if max_cluster_ratio <= 0.90 else float(np.clip(1.0 - 1.5 * (max_cluster_ratio - 0.90), 0.5, 1.0))
         
     min_cluster_ratio = np.min(counts) / np.sum(mask)
-    micro_penalty = 1.0 if min_cluster_ratio > 0.01 else 0.5
+    micro_penalty = 1.0 if min_cluster_ratio >= 0.01 else float(np.clip(min_cluster_ratio / 0.01, 0.75, 1.0))
 
     if n_clusters is None: 
         n_clusters = len(unique_labels)
 
-    try: sil = float(silhouette_score(X[mask], labels[mask]))
-    except: sil = 0.0
+    # 1. Сбор базовых метрик с защитой от NaN/Inf
+    try: 
+        sil = float(silhouette_score(X[mask], labels[mask]))
+        if np.isnan(sil) or np.isinf(sil):
+            sil = 0.0
+    except: 
+        sil = 0.0
 
     overlap_score = compute_overlap_penalty(X=X, labels=labels)
 
     try:
         ch_raw = float(calinski_harabasz_score(X[mask], labels[mask]))
-        ch = np.log1p(ch_raw) / (np.log1p(ch_raw) + 5.0)
-    except: ch = 0.0
+        if np.isnan(ch_raw) or np.isinf(ch_raw) or ch_raw < 0.0:
+            ch = 0.0
+        else:
+            ch = np.log1p(ch_raw) / (np.log1p(ch_raw) + 2.0)
+    except: 
+        ch = 0.0
 
-    gap_score = float(np.tanh(gap / 3)) if gap is not None and not np.isnan(gap) else 0.0
-    stability = float(np.clip(stability, 0.0, 1.0))
+    if gap is not None and not np.isnan(gap) and not np.isinf(gap):
+        gap_score = float(np.clip(np.tanh(gap / 3), 0.0, 1.0))
+    else:
+        gap_score = 0.0
+
+    if np.isnan(stability) or np.isinf(stability):
+        stability = 0.0
+    else:
+        stability = float(np.clip(stability, 0.0, 1.0))
+        
     centroid_sep = compute_centroid_separation(X=X, labels=labels)
 
-    if n_clusters == 2: k_penalty = 1.0  
-    elif 3 <= n_clusters <= 7: k_penalty = 1.1  
-    else: k_penalty = 5 / n_clusters if n_clusters > 7 else 0.1
+    # 2. Динамические веса для универсальности оценки (наличие/отсутствие gap_score)
+    metric_weights = {
+        "sil": 0.35,
+        "overlap": 0.20,
+        "ch": 0.15,
+        "centroid": 0.15,
+        "stability": 0.10
+    }
+    if gap is not None and not np.isnan(gap) and not np.isinf(gap):
+        metric_weights["gap"] = 0.05
 
-    # 1. ЖЁСТКИЙ ШТРАФ ЗА ШУМ (прощаем до 5%, далее — экспоненциальное падение)
-    # При 5% шума = 1.0 | При 10% шума = 0.6 | При 20% шума = 0.22
-    noise_penalty = float(np.exp(-10 * max(0.0, noise_ratio - 0.05)))
+    total_weight = sum(metric_weights.values())
+
+    raw_base = (
+        metric_weights["sil"] * max(0.0, sil) +
+        metric_weights["overlap"] * overlap_score +
+        metric_weights["ch"] * ch +
+        metric_weights["centroid"] * centroid_sep +
+        metric_weights["stability"] * stability
+    )
+    if "gap" in metric_weights:
+        raw_base += metric_weights["gap"] * gap_score
+
+    base_score = raw_base / total_weight
+
+    # 3. Калибровка коэффициента растяжения
+    # Коэффициент снижен с 1.6 до 1.2 для точной дифференциации неидеальных моделей
+    normalized_base = float(np.clip(base_score * 1.2, 0.0, 1.0))
+
+    # 4. Штрафы и коэффициенты (без бонуса 1.1 для k_penalty)
+    if n_clusters == 2: 
+        k_penalty = 0.95  # Легкий штраф за тривиальность (2 кластера)
+    elif 3 <= n_clusters <= 7: 
+        k_penalty = 1.0   # Идеальное число кластеров, без штрафов и бонусов
+    else: 
+        k_penalty = float(np.exp(-0.02 * max(0, n_clusters - 7)))
+
+    # Мягкий штраф за шум (пропорционально количеству шума)
+    noise_penalty = float(np.clip(1.0 - noise_ratio, 0.0, 1.0))
 
     separation_penalty = 1.0 if sil > 0.1 else (max(0.01, float(sil)) / 0.1)
     merge_multiplier = overlap_score if strong_overlap_penalty else np.sqrt(overlap_score)
 
-    # Собираем базовую метрику (игнорируем отрицательный силуэт)
-    base_score = (
-        0.35 * max(0.0, sil) + 
-        0.20 * overlap_score + 
-        0.15 * ch + 
-        0.15 * centroid_sep + 
-        0.10 * stability + 
-        0.05 * gap_score
-    )
-
-    # 2. НОРМАЛИЗАЦИЯ И РАСТЯЖЕНИЕ
-    # Умножаем на 1.6, так как сырая сумма метрик редко пробивает 0.6 даже при идеальной кластеризации
-    normalized_base = float(np.clip(base_score * 1.6, 0.0, 1.0))
-
-    # Применяем все штрафы
     final_multiplier = (k_penalty * noise_penalty * separation_penalty * merge_multiplier * balance_penalty * micro_penalty)
     
     # Итоговый скор строго в [0, 1]
