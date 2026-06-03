@@ -9,7 +9,8 @@ from logging import Logger
 from sklearn.base import clone
 from sklearn.model_selection import cross_val_score
 from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics import silhouette_score, calinski_harabasz_score, pairwise_distances
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score, pairwise_distances
+from scipy.sparse.csgraph import connected_components
 from sklearn.cluster import (
     KMeans, BisectingKMeans, MeanShift, OPTICS, Birch, 
     DBSCAN, AgglomerativeClustering, estimate_bandwidth
@@ -56,6 +57,71 @@ def compute_overlap_penalty(*, X: np.ndarray, labels: np.ndarray) -> float:
         return float(purity) if not np.isnan(purity) else 1.0
     except:
         return 1.0
+
+def compute_connectivity_penalty(*, X: np.ndarray, labels: np.ndarray) -> float:
+    labels = np.asarray(labels)
+    mask = labels != -1
+    X_clean = X[mask]
+    labels_clean = labels[mask]
+    
+    unique_labels = np.unique(labels_clean)
+    if len(unique_labels) < 1 or len(X_clean) < 3:
+        return 1.0
+        
+    try:
+        neigh = NearestNeighbors(n_neighbors=2)
+        neigh.fit(X_clean)
+        dists, _ = neigh.kneighbors(X_clean)
+        median_nn = float(np.median(dists[:, 1]))
+    except Exception:
+        median_nn = 0.0
+        
+    if median_nn <= 1e-8:
+        median_nn = 1e-4
+        
+    threshold = median_nn * 3.0
+    
+    cluster_penalties = []
+    
+    for label in unique_labels:
+        cluster_mask = labels_clean == label
+        X_cluster = X_clean[cluster_mask]
+        n_points = X_cluster.shape[0]
+        
+        if n_points < 3:
+            cluster_penalties.append(1.0)
+            continue
+            
+        try:
+            rn = NearestNeighbors(radius=threshold)
+            rn.fit(X_cluster)
+            adj_matrix = rn.radius_neighbors_graph(X_cluster, mode='connectivity')
+            
+            n_components, labels_components = connected_components(
+                csgraph=adj_matrix, directed=False, return_labels=True
+            )
+            
+            if n_components <= 1:
+                cluster_penalties.append(1.0)
+                continue
+                
+            comp_labels, comp_counts = np.unique(labels_components, return_counts=True)
+            
+            min_size = max(3, int(np.ceil(n_points * 0.05)))
+            major_components = np.sum(comp_counts >= min_size)
+            
+            if major_components <= 1:
+                cluster_penalties.append(1.0)
+            else:
+                extra_components = major_components - 1
+                penalty = float(0.85 ** extra_components)
+                cluster_penalties.append(penalty)
+        except Exception:
+            cluster_penalties.append(1.0)
+            
+    if len(cluster_penalties) > 0:
+        return float(np.mean(cluster_penalties))
+    return 1.0
 
 def compute_centroid_separation(*, X, labels) -> float:
     unique = np.unique(labels[labels != -1])
@@ -104,6 +170,15 @@ def compute_unified_score(
     except: 
         sil = 0.0
 
+    try:
+        dbi_raw = float(davies_bouldin_score(X[mask], labels[mask]))
+        if np.isnan(dbi_raw) or np.isinf(dbi_raw) or dbi_raw < 0.0:
+            dbi = 0.0
+        else:
+            dbi = 1.0 / (1.0 + dbi_raw)
+    except:
+        dbi = 0.0
+
     overlap_score = compute_overlap_penalty(X=X, labels=labels)
 
     try:
@@ -129,8 +204,9 @@ def compute_unified_score(
 
     # 2. Динамические веса для универсальности оценки (наличие/отсутствие gap_score)
     metric_weights = {
-        "sil": 0.35,
-        "overlap": 0.20,
+        "sil": 0.25,
+        "dbi": 0.15,
+        "overlap": 0.15,
         "ch": 0.15,
         "centroid": 0.15,
         "stability": 0.10
@@ -142,6 +218,7 @@ def compute_unified_score(
 
     raw_base = (
         metric_weights["sil"] * max(0.0, sil) +
+        metric_weights["dbi"] * dbi +
         metric_weights["overlap"] * overlap_score +
         metric_weights["ch"] * ch +
         metric_weights["centroid"] * centroid_sep +
@@ -170,14 +247,17 @@ def compute_unified_score(
     separation_penalty = 1.0 if sil > 0.1 else (max(0.01, float(sil)) / 0.1)
     merge_multiplier = overlap_score if strong_overlap_penalty else np.sqrt(overlap_score)
 
-    final_multiplier = (k_penalty * noise_penalty * separation_penalty * merge_multiplier * balance_penalty * micro_penalty)
+    # Расчет штрафа связности (Connectivity Penalty)
+    connectivity_penalty = compute_connectivity_penalty(X=X, labels=labels)
+
+    final_multiplier = (k_penalty * noise_penalty * separation_penalty * merge_multiplier * balance_penalty * micro_penalty * connectivity_penalty)
     
     # Итоговый скор строго в [0, 1]
     score = float(np.clip(normalized_base * final_multiplier, 0.0, 1.0))
 
     weights = {
-        "formula": {"silhouette": sil, "calinski_harabasz": ch, "stability": stability, "gap_score": gap_score, "overlap_score": overlap_score, "centroid_sep": centroid_sep},
-        "multipliers": {"noise_penalty": noise_penalty, "separation_penalty": separation_penalty, "k_penalty": k_penalty, "merge_multiplier": merge_multiplier, "balance_penalty": balance_penalty, "micro_penalty": micro_penalty}
+        "formula": {"silhouette": sil, "davies_bouldin": dbi, "calinski_harabasz": ch, "stability": stability, "gap_score": gap_score, "overlap_score": overlap_score, "centroid_sep": centroid_sep},
+        "multipliers": {"noise_penalty": noise_penalty, "separation_penalty": separation_penalty, "k_penalty": k_penalty, "merge_multiplier": merge_multiplier, "balance_penalty": balance_penalty, "micro_penalty": micro_penalty, "connectivity_penalty": connectivity_penalty}
     }
     return score, weights
 

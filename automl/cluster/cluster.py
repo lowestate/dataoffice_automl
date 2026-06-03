@@ -159,8 +159,8 @@ def train_all_models(X_spaces, logger, config: ClusteringConfig, random_state: i
                         continue
 
             # Форматирование метаданных
-            formula_keys = ["silhouette", "calinski_harabasz", "stability", "gap_score", "overlap_score", "centroid_sep"]
-            multiplier_keys = ["noise_penalty", "separation_penalty", "k_penalty", "merge_multiplier", "balance_penalty", "micro_penalty"]
+            formula_keys = ["silhouette", "calinski_harabasz", "stability", "gap_score", "overlap_score", "centroid_sep", "davies_bouldin"]
+            multiplier_keys = ["noise_penalty", "separation_penalty", "k_penalty", "merge_multiplier", "balance_penalty", "micro_penalty", "connectivity_penalty"]
             extra_for_f = {f"f_{k}": weights.get("formula", {}).get(k) for k in formula_keys} | \
                           {f"m_{k}": weights.get("multipliers", {}).get(k) for k in multiplier_keys}
 
