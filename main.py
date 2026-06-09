@@ -11,6 +11,7 @@ from fastapi import FastAPI, Form, BackgroundTasks
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
+import numpy as np
 import base64
 import io
 import uvicorn
@@ -39,6 +40,8 @@ from db.queries import (
     get_automl_chat,
     delete_automl_chat,
     delete_untrained_chats_by_user,
+    get_user_plan_id,
+    get_model_by_id,
 )
 
 from redisclient import RedisClient
@@ -107,6 +110,16 @@ def make_minio_key(user_id: int, filename: str) -> str:
     return f"{user_id}/{folder_name}/{filename}"
 
 
+def make_encoder_minio_key(minio_key: str) -> str:
+    import os
+    parts = minio_key.split("/")
+    if len(parts) >= 2:
+        return f"{parts[0]}/{parts[1]}/feature_encoder.pkl"
+    else:
+        folder_name, _ = os.path.splitext(minio_key)
+        return f"{folder_name}_feature_encoder.pkl"
+
+
 def parse_from_b64(file_b64: str) -> pd.DataFrame:
     file_bytes = base64.b64decode(file_b64)
     buf = io.BytesIO(file_bytes)
@@ -124,9 +137,11 @@ def run_automl(
     df: pd.DataFrame,
     cols_to_remove: list[str],
     user_id: int,
+    plan_id: int = 3,
     progress_callback: Optional[Callable[[str, int], None]] = None,
+    lencoder: Optional[Any] = None,
 ) -> dict:
-    logger.info(f"new request received | user_id={user_id} task={task} target={target}")
+    logger.info(f"new request received | user_id={user_id} task={task} target={target} plan_id={plan_id}")
     automl = AutoML(logger=logger, random_state=42)
 
     try:
@@ -148,10 +163,12 @@ def run_automl(
             cols_to_remove=cols_to_remove,
             preprocessing=False,
             progress_callback=progress_callback,
+            plan_id=plan_id,
+            lencoder=lencoder,
         )
 
-        if task == "clustering":
-            save_clustering_report(training_result=training_result, filepath="clustering_report.txt")
+        # if task == "clustering":
+        #     save_clustering_report(training_result=training_result, filepath="clustering_report.txt")
 
     except ValueError as e:
         return {"error": str(e)}
@@ -180,7 +197,6 @@ async def save_all_models_background(
     except Exception as e:
         logger.exception(f"background save error: {e}")
 
-
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -204,7 +220,7 @@ async def get_corr(
     df_raw = parse_from_b64(file_b64)
 
     automl_inst = AutoML(logger=logger)
-    _, _, df_corr, _, _ = automl_inst.preprocess(
+    _, _, df_corr, _, label_encoder = automl_inst.preprocess(
         df=df_raw,
         task="classification",
         cols_to_remove=[],
@@ -212,12 +228,21 @@ async def get_corr(
 
     corr_matrix, labels = compute_mixed_corr(df_corr)
 
-    # Ключ MinIO: "{user_id}/{safe_filename}" — из него восстанавливается имя файла
-    minio_key = make_minio_key(uid, filename)
+    # Регистрируем новый чат в automl_chats сразу после загрузки датасета
+    chat_id = uuid.uuid4().hex
+
+    # Ключ MinIO: "{chat_id}/{safe_filename}" — из него восстанавливается имя файла
+    minio_key = f"{chat_id}/{filename}"
 
     try:
         dataset_bytes = pickle.dumps(df_corr)
         await upload_dataset_to_minio(minio_key, dataset_bytes)
+
+        # Сохраняем feature encoder в MinIO, если он есть
+        if label_encoder is not None:
+            encoder_key = make_encoder_minio_key(minio_key)
+            encoder_bytes = pickle.dumps(label_encoder)
+            await upload_dataset_to_minio(encoder_key, encoder_bytes)
 
         # Сохраняем ключ в Redis под user_id (TTL = 15 мин)
         # Это перезаписывает предыдущий датасет юзера в кэше Redis (один файл одновременно)
@@ -226,8 +251,6 @@ async def get_corr(
         # Защита от спама: удаляем любой предыдущий чат пользователя, в котором еще не началось обучение
         await delete_untrained_chats_by_user(uid)
 
-        # Регистрируем новый чат в automl_chats сразу после загрузки датасета
-        chat_id = uuid.uuid4().hex
         await insert_automl_chat(
             chat_id=chat_id,
             user_id=uid,
@@ -263,14 +286,25 @@ async def background_train_flow(
     cols_to_remove: list[str],
     user_id: int,
     files_minio_key: str,
+    plan_id: int,
 ) -> None:
     """Выполняет скачивание датасета, обучение AutoML и сохранение результатов в фоне."""
-    logger.info(f"[Background] Starting training_id={training_id} for user_id={user_id}...")
+    logger.info(f"[Background] Starting training_id={training_id} for user_id={user_id} plan_id={plan_id}...")
     try:
         # 1. Скачиваем очищенный датасет из MinIO
         redis.set_training_progress(training_id, "Загрузка данных", 0)
         dataset_bytes = await download_dataset_from_minio(files_minio_key)
         df = pickle.loads(dataset_bytes)
+
+        # 1.5. Пробуем скачать feature encoder
+        lencoder = None
+        try:
+            encoder_key = make_encoder_minio_key(files_minio_key)
+            encoder_bytes = await download_dataset_from_minio(encoder_key)
+            lencoder = pickle.loads(encoder_bytes)
+            logger.info(f"[Background] Loaded feature encoder from MinIO: {encoder_key}")
+        except Exception as e:
+            logger.info(f"[Background] Feature encoder not found or failed to load: {e}")
 
         # 2. Запускаем обучение
         overall_train_start = datetime.now(timezone.utc)
@@ -284,7 +318,9 @@ async def background_train_flow(
             df=df,
             cols_to_remove=cols_to_remove,
             user_id=user_id,
+            plan_id=plan_id,
             progress_callback=progress_cb,
+            lencoder=lencoder,
         )
         overall_train_finish = datetime.now(timezone.utc)
 
@@ -366,6 +402,13 @@ async def train(
     - Запускаем background_train_flow в фоне и возвращаем chat_id немедленно.
     """
     uid = int(user_id)
+    plan_id = await get_user_plan_id(uid)
+
+    if task == "clustering" and plan_id == 1:
+        return JSONResponse(
+            {"error": "Clustering task is not available for junior plan"},
+            status_code=403,
+        )
 
     if cols_to_remove:
         try:
@@ -406,6 +449,7 @@ async def train(
             target=target,
             overall_train_finish=overall_train_start,
             status="training",
+            plan_id=plan_id,
         )
         new_training_id = existing_training_id
     else:
@@ -417,6 +461,7 @@ async def train(
             overall_train_start=overall_train_start,
             overall_train_finish=overall_train_start,
             status="training",
+            plan_id=plan_id,
         )
         # Привязываем training_id к automl_chats
         await update_automl_chat_training(chat_id=data_id, training_id=new_training_id)
@@ -435,6 +480,7 @@ async def train(
         cols_to_remove=columns_to_remove,
         user_id=uid,
         files_minio_key=files_minio_key,
+        plan_id=plan_id,
     )
 
     return JSONResponse(
@@ -524,34 +570,71 @@ async def delete_history(chat_id: str):
     return {"message": "Deleted successfully"}
 
 
+def is_model_allowed(model_name: str, task_type: str, plan_id: int) -> bool:
+    base_name = model_name.split("_")[0]
+    
+    if task_type == "clustering":
+        if plan_id <= 1:
+            return False
+        pool2 = {"KMeans", "DBSCAN", "Birch", "AgglomerativeClustering"}
+        if plan_id == 2:
+            return base_name in pool2
+        pool3 = {"BisectingKMeans", "HDBSCAN", "OPTICS", "MeanShift", "GaussianMixture"}
+        return base_name in pool2 or base_name in pool3
+    else:
+        # classification or regression
+        pool1 = {
+            "LogisticRegression", "DecisionTree", "NaiveBayes", "KNN", "RandomForest", "SVC",
+            "LinearRegression", "Ridge", "Lasso", "SVR"
+        }
+        if plan_id == 1:
+            return base_name in pool1
+        pool2 = {"GradientBoosting", "XGBoost", "LightGBM", "CatBoost"}
+        return base_name in pool1 or base_name in pool2
+
+
 @app.get("/history/{chat_id}")
 async def get_history_detail(chat_id: str):
     chat = await get_automl_chat(chat_id)
     detail = None
+    user_id = None
     if not chat:
         # Fallback for backward compatibility with old numeric training_id
         if chat_id.isdigit():
             detail = await get_training_detail(int(chat_id))
             if not detail:
                 return JSONResponse({"error": "Training result not found"}, status_code=404)
+            tr_res = await get_training_result(int(chat_id))
+            user_id = tr_res.get("user_id") if tr_res else 1
         else:
             return JSONResponse({"error": "Chat session not found"}, status_code=404)
         
         files_minio_key = detail["files_minio_key"]
         filename = detail["filename"]
     else:
+        user_id = chat["user_id"]
         if chat["training_id"]:
             detail = await get_training_detail(chat["training_id"])
         
         files_minio_key = detail["files_minio_key"] if detail else chat["files_minio_key"]
         filename = detail["filename"] if detail else chat["dataset_name"]
 
+    plan_id = await get_user_plan_id(user_id) if user_id else 1
+    task_type = str(detail.get("task_type") or "") if detail else ""
+
     models_dict = detail.get("models", {}) if detail else {}
-    result_data = (
-        {"training": {"models": models_dict}}
-        if models_dict
-        else None
-    )
+    
+    filtered_models_dict = {}
+    for model_name, model_data in models_dict.items():
+        if is_model_allowed(model_data.get("model_name", model_name), task_type, plan_id):
+            model_copy = dict(model_data)
+            model_copy["is_locked"] = False
+            filtered_models_dict[model_name] = model_copy
+
+    result_data = {
+        "training": {"models": filtered_models_dict},
+        "trained_plan_id": detail.get("plan_id") if detail else None
+    }
 
     try:
         dataset_bytes = await download_dataset_from_minio(files_minio_key)
@@ -603,6 +686,279 @@ async def download_file_endpoint(
     except Exception as e:
         logger.exception(f"Error downloading file {minio_key}: {e}")
         return JSONResponse({"error": f"Failed to download file: {str(e)}"}, status_code=500)
+
+
+import zipfile
+
+@app.get("/download-zip")
+async def download_zip_endpoint(
+    keys: str,
+    filenames: str,
+    archive_name: str = "model_files.zip"
+) -> Any:
+    """
+    Скачивает несколько файлов из MinIO, упаковывает их в ZIP-архив в памяти и отдаёт пользователю.
+    """
+    logger.info(f"download-zip requested | keys={keys} filenames={filenames}")
+    try:
+        key_list = keys.split(",")
+        name_list = filenames.split(",")
+        
+        if len(key_list) != len(name_list):
+            return JSONResponse({"error": "Number of keys must match number of filenames"}, status_code=400)
+            
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+            for k, name in zip(key_list, name_list):
+                try:
+                    file_bytes = await download_dataset_from_minio(k.strip())
+                    zip_file.writestr(name.strip(), file_bytes)
+                except Exception as file_err:
+                    logger.error(f"Failed to add file {k} to zip: {file_err}")
+                    
+        zip_buffer.seek(0)
+        return StreamingResponse(
+            zip_buffer,
+            media_type="application/zip",
+            headers={"Content-Disposition": f'attachment; filename="{archive_name}"'}
+        )
+    except Exception as e:
+        logger.exception(f"Error generating zip download: {e}")
+        return JSONResponse({"error": f"Failed to generate zip: {str(e)}"}, status_code=500)
+
+
+_MODEL_CACHE = {}
+
+@app.post("/predict/{model_id}")
+async def predict_endpoint(model_id: int, request_data: dict, user_id: Optional[int] = None) -> JSONResponse:
+    """
+    Принимает input данные для предсказания конкретной модели по model_id.
+    Данные передаются как словарь {"data": [{...}, {...}]} или список [{...}] или просто {...}.
+    Возвращает предсказания.
+    """
+    u_id = user_id
+    if u_id is None:
+        u_id = request_data.get("user_id")
+
+    if u_id is None:
+        return JSONResponse({"error": "Unauthorized: user_id is required"}, status_code=401)
+
+    try:
+        # Детально проверяем статус пользователя в БД (активен, не забанен, существует)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT is_active, is_banned FROM users WHERE user_id = %s",
+                    (int(u_id),),
+                )
+                row = await cur.fetchone()
+        
+        if not row:
+            return JSONResponse({"error": "Unauthorized: user does not exist"}, status_code=401)
+        
+        is_active, is_banned = row[0], row[1]
+        if is_banned:
+            return JSONResponse(
+                {"error": "Forbidden: Вы заблокированы за нарушение правил безопасности. Обратитесь к администратору."},
+                status_code=403
+            )
+        if not is_active:
+            return JSONResponse(
+                {"error": "Forbidden: Ваш аккаунт деактивирован."},
+                status_code=403
+            )
+    except Exception as e:
+        logger.error(f"Error checking user authorization: {e}")
+        return JSONResponse({"error": "Unauthorized: invalid user_id format or database error"}, status_code=401)
+
+    logger.info(f"predict requested | model_id={model_id} | user_id={u_id}")
+    try:
+        # 1. Проверяем кэш
+        if model_id in _MODEL_CACHE:
+            cached = _MODEL_CACHE[model_id]
+            # Проверяем, существует ли ещё модель в БД (могла быть удалена)
+            model_info = await get_model_by_id(model_id)
+            if not model_info:
+                _MODEL_CACHE.pop(model_id, None)
+                return JSONResponse({"error": f"Model with ID {model_id} not found"}, status_code=404)
+        else:
+            model_info = await get_model_by_id(model_id)
+            if not model_info:
+                return JSONResponse({"error": f"Model with ID {model_id} not found"}, status_code=404)
+
+            meta = model_info.get("model_metadata") or {}
+            files = meta.get("files") or {}
+
+            if "model" not in files:
+                return JSONResponse({"error": "Model binary file not found for this model"}, status_code=404)
+
+            # Скачиваем бинарник модели
+            model_bytes = await download_dataset_from_minio(files["model"]["minio_key"])
+            model_obj = pickle.loads(model_bytes)
+
+            scaler_obj = None
+            if "scaler" in files:
+                try:
+                    scaler_bytes = await download_dataset_from_minio(files["scaler"]["minio_key"])
+                    scaler_obj = pickle.loads(scaler_bytes)
+                except Exception as e:
+                    logger.warning(f"Failed to load scaler: {e}")
+
+            fe_obj = None
+            if "feature_encoder" in files:
+                try:
+                    fe_bytes = await download_dataset_from_minio(files["feature_encoder"]["minio_key"])
+                    fe_obj = pickle.loads(fe_bytes)
+                except Exception as e:
+                    logger.warning(f"Failed to load feature encoder: {e}")
+
+            te_obj = None
+            if "target_encoder" in files:
+                try:
+                    te_bytes = await download_dataset_from_minio(files["target_encoder"]["minio_key"])
+                    te_obj = pickle.loads(te_bytes)
+                except Exception as e:
+                    logger.warning(f"Failed to load target encoder: {e}")
+
+            pca_obj = None
+            if "pca" in files:
+                try:
+                    pca_bytes = await download_dataset_from_minio(files["pca"]["minio_key"])
+                    pca = pickle.loads(pca_bytes)
+                except Exception as e:
+                    logger.warning(f"Failed to load pca reducer: {e}")
+
+            cached = {
+                "model": model_obj,
+                "scaler": scaler_obj,
+                "feature_encoder": fe_obj,
+                "target_encoder": te_obj,
+                "pca": pca_obj,
+                "task_type": model_info["task_type"],
+                "target": model_info["target"],
+                "model_name": model_info["model_name"],
+                "selected_features": meta.get("selected_features") or [],
+                "centroids": meta.get("centroids") or {},
+            }
+            _MODEL_CACHE[model_id] = cached
+
+        # 2. Парсим входные данные
+        raw_data = request_data.get("data") if "data" in request_data else request_data
+        if isinstance(raw_data, dict):
+            raw_data = [raw_data]
+        elif not isinstance(raw_data, list):
+            return JSONResponse({"error": "Input data must be a dictionary or a list of dictionaries"}, status_code=400)
+
+        df_input = pd.DataFrame(raw_data)
+
+        # 3. Предобработка
+        df_processed = df_input.copy()
+        fe = cached["feature_encoder"]
+        scaler = cached["scaler"]
+        pca = cached["pca"]
+        model = cached["model"]
+        selected_features = cached["selected_features"]
+        task_type = cached["task_type"]
+
+        # Кодирование категориальных признаков
+        if fe is not None and hasattr(fe, "feature_names_in_"):
+            for col in fe.feature_names_in_:
+                if col in df_processed.columns:
+                    df_processed[col] = pd.Series(df_processed[col]).fillna("missing").astype(str)
+            cols_to_encode = [c for c in fe.feature_names_in_ if c in df_processed.columns]
+            if cols_to_encode:
+                df_processed[cols_to_encode] = fe.transform(df_processed[cols_to_encode])
+
+        # Масштабирование числовых признаков
+        if scaler is not None and hasattr(scaler, "feature_names_in_"):
+            for col in scaler.feature_names_in_:
+                if col in df_processed.columns:
+                    num_series = pd.to_numeric(df_processed[col], errors="coerce")
+                    df_processed[col] = pd.Series(num_series).fillna(0)
+            cols_to_scale = [c for c in scaler.feature_names_in_ if c in df_processed.columns]
+            if cols_to_scale:
+                df_processed[cols_to_scale] = scaler.transform(df_processed[cols_to_scale])
+
+        # Подготовка финальной матрицы признаков X
+        if task_type == "clustering":
+            if selected_features:
+                for col in selected_features:
+                    if col not in df_processed.columns:
+                        df_processed[col] = 0
+                X = df_processed[selected_features]
+            else:
+                X = df_processed
+
+            if pca is not None:
+                X = pca.transform(X)
+
+            centroids = cached.get("centroids") or {}
+            if centroids:
+                preds_list = []
+                X_array = X.to_numpy() if hasattr(X, "to_numpy") else np.asarray(X)
+                for row in X_array:
+                    distances = {}
+                    for c_name, c_val in centroids.items():
+                        if c_name == "cluster_-1":
+                            continue
+                        dist = float(np.linalg.norm(row - np.array(c_val)))
+                        distances[c_name] = dist
+                    sorted_dists = dict(sorted(distances.items(), key=lambda item: item[1]))
+                    preds_list.append(sorted_dists)
+                predictions = preds_list
+            else:
+                if hasattr(model, "predict"):
+                    preds = model.predict(X)
+                else:
+                    preds = model.fit_predict(X)
+                predictions = preds.tolist()
+
+        else:
+            is_linear = cached["model_name"].split("_")[0] in ["LogisticRegression", "LinearRegression", "Ridge", "Lasso"]
+
+            base_features = []
+            for f in selected_features:
+                for part in f.split():
+                    base_name = part.split('^')[0]
+                    if base_name not in base_features:
+                        base_features.append(base_name)
+
+            if not base_features:
+                base_features = selected_features
+
+            for col in base_features:
+                if col not in df_processed.columns:
+                    df_processed[col] = 0
+
+            if is_linear:
+                from sklearn.preprocessing import PolynomialFeatures
+                poly = PolynomialFeatures(degree=2, include_bias=False)
+                X_base = df_processed[base_features]
+                X_poly = pd.DataFrame(poly.fit_transform(X_base), columns=poly.get_feature_names_out(base_features))
+                
+                for col in selected_features:
+                    if col not in X_poly.columns:
+                        X_poly[col] = 0
+                X = X_poly[selected_features]
+            else:
+                X = df_processed[selected_features]
+
+            preds = model.predict(X)
+
+            te = cached["target_encoder"]
+            if te is not None and task_type == "classification":
+                try:
+                    preds = te.inverse_transform(preds)
+                except Exception as e:
+                    logger.warning(f"Failed to inverse transform predictions: {e}")
+
+            predictions = preds.tolist()
+
+        return JSONResponse({"predictions": predictions}, status_code=200)
+
+    except Exception as e:
+        logger.exception(f"Error in predict_endpoint: {e}")
+        return JSONResponse({"error": f"Internal Server Error: {str(e)}"}, status_code=500)
 
 
 @app.exception_handler(Exception)

@@ -40,12 +40,15 @@ from automl.optuna import optimize_model, compute_unified_score
 from typing import Callable, Optional
 #from automl.cluster.posthoc_scores import compute_unified_score
 
-def train_all_models(X_spaces, logger, config: ClusteringConfig, random_state: int, progress_callback: Optional[Callable[..., None]] = None):
+def train_all_models(X_spaces, logger, config: ClusteringConfig, random_state: int, progress_callback: Optional[Callable[..., None]] = None, plan_id: int = 3):
     results = []
     # Эталон для оценки (то, что мы видим глазами)
     X_eval = X_spaces['manifold'][:, :2]
 
     for space_name, X_cluster in X_spaces.items():
+        if plan_id < 3 and space_name == 'manifold':
+            continue
+            
         if space_name == 'manifold':
             X_train = X_cluster[:, :2]
         else:
@@ -56,6 +59,13 @@ def train_all_models(X_spaces, logger, config: ClusteringConfig, random_state: i
         models_to_train = ["KMeans", "BisectingKMeans", "GaussianMixture", "DBSCAN", "HDBSCAN", "OPTICS", "MeanShift", "Birch"]
         if X_train.shape[0] <= 15000:
             models_to_train.append("AgglomerativeClustering")
+
+        # Filter by plan_id: Middle (2) can only train Pool 2 models
+        if plan_id <= 1:
+            models_to_train = []
+        elif plan_id == 2:
+            pool2 = {"KMeans", "DBSCAN", "Birch", "AgglomerativeClustering"}
+            models_to_train = [m for m in models_to_train if m in pool2]
 
         for name in models_to_train:
             if (space_name == "manifold" and name in ["KMeans", "BisectingKMeans", "GaussianMixture", "MeanShift", "Birch"]) or \
@@ -192,6 +202,7 @@ def cluster(
         random_state: int,
         config: ClusteringConfig,
         progress_callback: Optional[Callable[..., None]] = None,
+        plan_id: int = 3,
     ) -> dict[str, dict[str, ClusteringResult]]:
     
     logger.info("clustering started")
@@ -206,7 +217,7 @@ def cluster(
     X_viz_base = X_spaces["manifold"] # Используем это для отрисовки
 
     # 2. Обучаем и тюним все модели
-    all_models_raw = train_all_models(X_spaces, logger, config, random_state, progress_callback=progress_callback)
+    all_models_raw = train_all_models(X_spaces, logger, config, random_state, progress_callback=progress_callback, plan_id=plan_id)
     
     # Сортируем по нашему новому унифицированному скору
     all_models = sorted(
@@ -273,7 +284,8 @@ def cluster(
             metrics_orig=m.get("metrics_orig", {}),
             metrics_norm=m.get("metrics_norm", {}),
             train_start=m["train_start"],
-            train_finish=m["train_finish"]
+            train_finish=m["train_finish"],
+            selected_features=df.columns.tolist()
         )
 
         logger.info(f"{m['name']} | serialized successfully")

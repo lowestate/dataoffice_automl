@@ -27,10 +27,10 @@ class TrainingPersistenceService:
             files_minio_key = tr.get("files_minio_key") or tr.get("files_minio_key") or ""
             task_type = tr.get("task_type") or "classification"
 
-            # 2. Восстанавливаем папку {user_id}/{filename}
+            # 2. Восстанавливаем папку (теперь это chat_id)
             parts = files_minio_key.split("/")
             if len(parts) >= 2:
-                folder_path = f"{parts[0]}/{parts[1]}"
+                folder_path = parts[0]
             else:
                 folder_path = f"{user_id}/{files_minio_key or 'dataset.csv'}"
 

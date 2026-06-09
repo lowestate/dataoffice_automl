@@ -21,6 +21,9 @@ async def run_startup_migrations() -> None:
         await conn.execute(
             "ALTER TABLE training_result ADD COLUMN IF NOT EXISTS status VARCHAR(50) DEFAULT 'completed'"
         )
+        await conn.execute(
+            "ALTER TABLE training_result ADD COLUMN IF NOT EXISTS plan_id INTEGER DEFAULT 3"
+        )
         # train_start / train_finish в models_metadata — добавлялись позже
         await conn.execute(
             "ALTER TABLE models_metadata ADD COLUMN IF NOT EXISTS train_start TIMESTAMP WITH TIME ZONE DEFAULT NOW()"
@@ -94,6 +97,7 @@ async def insert_training_result(
     overall_train_start: datetime,
     overall_train_finish: datetime,
     status: str = "completed",
+    plan_id: int = 3,
 ) -> int:
     """Вставляет новую запись в training_result и возвращает её training_id."""
     async with pool.connection() as conn:
@@ -101,11 +105,11 @@ async def insert_training_result(
             await cur.execute(
                 """
                 INSERT INTO training_result
-                    (task_type, target, overall_train_start, overall_train_finish, status)
-                VALUES (%s, %s, %s, %s, %s)
+                    (task_type, target, overall_train_start, overall_train_finish, status, plan_id)
+                VALUES (%s, %s, %s, %s, %s, %s)
                 RETURNING training_id
                 """,
-                (task_type, target, overall_train_start, overall_train_finish, status),
+                (task_type, target, overall_train_start, overall_train_finish, status, plan_id),
             )
             row = await cur.fetchone()
             if not row:
@@ -120,17 +124,28 @@ async def update_training_result(
     target: Optional[str],
     overall_train_finish: datetime,
     status: str = "completed",
+    plan_id: Optional[int] = None,
 ) -> None:
     """Обновляет запись training_result при повторном обучении."""
     async with pool.connection() as conn:
-        await conn.execute(
-            """
-            UPDATE training_result
-            SET task_type = %s, target = %s, overall_train_finish = %s, status = %s
-            WHERE training_id = %s
-            """,
-            (task_type, target, overall_train_finish, status, training_id),
-        )
+        if plan_id is not None:
+            await conn.execute(
+                """
+                UPDATE training_result
+                SET task_type = %s, target = %s, overall_train_finish = %s, status = %s, plan_id = %s
+                WHERE training_id = %s
+                """,
+                (task_type, target, overall_train_finish, status, plan_id, training_id),
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE training_result
+                SET task_type = %s, target = %s, overall_train_finish = %s, status = %s
+                WHERE training_id = %s
+                """,
+                (task_type, target, overall_train_finish, status, training_id),
+            )
 
 
 async def get_training_result(training_id: int) -> Optional[dict]:
@@ -400,7 +415,7 @@ async def get_training_detail(training_id: int) -> Optional[dict]:
             # Основная запись
             await cur.execute(
                 """
-                SELECT tr.training_id, ac.files_minio_key, tr.task_type, tr.target, tr.status
+                SELECT tr.training_id, ac.files_minio_key, tr.task_type, tr.target, tr.status, tr.plan_id
                 FROM training_result tr
                 LEFT JOIN automl_chats ac ON tr.training_id = ac.training_id
                 WHERE tr.training_id = %s
@@ -415,7 +430,7 @@ async def get_training_detail(training_id: int) -> Optional[dict]:
             await cur.execute(
                 """
                 SELECT mm.model_id, mm.model_name, mm.hyperparameters, mm.metrics,
-                       mm.graphics, mm.model_metadata
+                       mm.graphics, mm.model_metadata, mm.place_in_training_batch
                 FROM training_x_models txm
                 JOIN models_metadata mm ON txm.model_id = mm.model_id
                 WHERE txm.training_id = %s
@@ -424,7 +439,7 @@ async def get_training_detail(training_id: int) -> Optional[dict]:
             )
             model_rows = await cur.fetchall()
 
-    training_id_val, files_minio_key, task_type, target, status = tr_row
+    training_id_val, files_minio_key, task_type, target, status, plan_id_val = tr_row
 
     # Восстанавливаем имя файла из ключа MinIO
     if files_minio_key and "/" in files_minio_key:
@@ -434,12 +449,14 @@ async def get_training_detail(training_id: int) -> Optional[dict]:
 
     models_dict: dict[str, Any] = {}
     for m_row in model_rows:
-        model_id, model_name, hyperparams, metrics, graphics, model_meta = m_row
+        model_id, model_name, hyperparams, metrics, graphics, model_meta, place_in_batch = m_row
         model_data: dict[str, Any] = {
+            "model_id": model_id,
             "model_name": model_name,
             "hyperparams": hyperparams,
             "metrics": metrics,
             "graphics": graphics,
+            "place_in_training_batch": place_in_batch,
         }
         if model_meta:
             for k, v in model_meta.items():
@@ -453,5 +470,68 @@ async def get_training_detail(training_id: int) -> Optional[dict]:
         "task_type": task_type,
         "target": target,
         "status": status,
+        "plan_id": plan_id_val,
         "models": models_dict,
     }
+
+
+async def get_model_by_id(model_id: int) -> Optional[dict]:
+    """Возвращает подробную информацию о модели по её model_id."""
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT model_id, model_name, hyperparameters, metrics,
+                       graphics, model_metadata, place_in_training_batch
+                FROM models_metadata
+                WHERE model_id = %s
+                """,
+                (model_id,),
+            )
+            row = await cur.fetchone()
+            if not row:
+                return None
+
+            # Нам также нужно узнать тип задачи (task_type) этой модели
+            await cur.execute(
+                """
+                SELECT tr.task_type, tr.target
+                FROM training_x_models txm
+                JOIN training_result tr ON txm.training_id = tr.training_id
+                WHERE txm.model_id = %s
+                """,
+                (model_id,),
+            )
+            tr_row = await cur.fetchone()
+            task_type = tr_row[0] if tr_row else "classification"
+            target = tr_row[1] if tr_row else None
+
+            model_id_val, model_name, hyperparams, metrics, graphics, model_meta, place_in_batch = row
+            return {
+                "model_id": model_id_val,
+                "model_name": model_name,
+                "hyperparams": hyperparams,
+                "metrics": metrics,
+                "graphics": graphics,
+                "model_metadata": model_meta,
+                "place_in_training_batch": place_in_batch,
+                "task_type": task_type,
+                "target": target,
+            }
+
+
+async def get_user_plan_id(user_id: int) -> int:
+    """
+    Возвращает plan_id пользователя из таблицы users.
+    По умолчанию возвращает 1 (junior).
+    """
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT plan_id FROM users WHERE user_id = %s",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 1
+
+

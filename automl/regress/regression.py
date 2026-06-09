@@ -35,10 +35,11 @@ def baseline(
         y_test: pd.Series | np.ndarray,
         scaler: StandardScaler,
         numeric_cols: list[str],
-        random_state: int
+        random_state: int,
+        plan_id: int = 3
     ) -> list[dict[str, Any]]:
     baseline_results = []
-    models = get_models(random_state)
+    models = get_models(random_state, plan_id=plan_id)
 
     for name, model in models.items():
         # Полиномиальные признаки только для линейных моделей
@@ -82,6 +83,7 @@ def regress(
         random_state: int,
         lencoder: OrdinalEncoder | None,
         progress_callback: Optional[Callable[..., None]] = None,
+        plan_id: int = 3,
     ) -> dict[str, dict[str, RegressResult]]:
     logger.info(f"regression started")
     if progress_callback:
@@ -125,7 +127,8 @@ def regress(
         y_test=y_test,
         scaler=scaler,
         numeric_cols=numeric_cols,
-        random_state=random_state
+        random_state=random_state,
+        plan_id=plan_id
     )
 
     top_models = sorted(
@@ -197,10 +200,8 @@ def regress(
         if progress_callback:
             progress_callback("Сохранение моделей", 5, m["name"])
         files = {
-            "model": serialize_file(
-                obj=best_model,
-                filename="model.joblib"
-            )
+            "model": serialize_file(obj=best_model, filename="model.joblib"),
+            "scaler": serialize_file(obj=scaler, filename="scaler.joblib")
         }
         if lencoder is not None:
             files["feature_encoder"] = serialize_file(obj=lencoder, filename="feature_encoder.joblib")

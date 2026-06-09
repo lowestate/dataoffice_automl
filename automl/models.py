@@ -178,7 +178,8 @@ class AutoML:
             lencoder: OrdinalEncoder | None = None,
             preprocessing=True,
             cols_to_remove: list[str] | None = None,
-            progress_callback: Callable[[str, int], None] | None = None
+            progress_callback: Callable[[str, int], None] | None = None,
+            plan_id: int = 3,
         ) -> tuple[dict[str, Any], dict | None]:
 
         task_func: Callable[..., dict[str, Any]] | None = TASK_REGISTRY.get(task_type)
@@ -215,7 +216,8 @@ class AutoML:
             "lencoder": lencoder,
             "config": config,
             "random_state": self.random_state,
-            "progress_callback": progress_callback
+            "progress_callback": progress_callback,
+            "plan_id": plan_id
         }
 
         if task_type == TaskType.CLUSTERING:

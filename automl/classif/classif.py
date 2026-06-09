@@ -85,6 +85,7 @@ def classif(
         random_state: int,
         lencoder: OrdinalEncoder | None,
         progress_callback: Optional[Callable[..., None]] = None,
+        plan_id: int = 3,
     ) -> dict[str, dict[str, ClassifResult]]:
     if progress_callback:
         progress_callback("Оценка базовых моделей", 1)
@@ -128,7 +129,7 @@ def classif(
 
     # ---------- BASELINE и отбор признаков для каждой модели ----------
     baseline_results = baseline(
-        models=get_models(class_weight, random_state),
+        models=get_models(class_weight, random_state, plan_id=plan_id),
         X_train_scaled=X_train_scaled,
         X_test_scaled=X_test_scaled,
         y_train=y_train,
@@ -219,7 +220,8 @@ def classif(
             progress_callback("Сохранение моделей", 5, m["name"])
         files = {
             "model": serialize_file(obj=best_model, filename="model.joblib"),
-            "target_encoder": serialize_file(obj=le, filename="target_encoder.joblib")
+            "target_encoder": serialize_file(obj=le, filename="target_encoder.joblib"),
+            "scaler": serialize_file(obj=scaler, filename="scaler.joblib")
         }
         if lencoder is not None:
             files["feature_encoder"] = serialize_file(obj=lencoder, filename="feature_encoder.joblib")

@@ -58,6 +58,7 @@ class ClusteringResult(BaseModelResult):
         Literal["model", "pca", "scaler", "feature_encoder"],
         dict[str, str]
     ]
+    selected_features: list[str]
 
 
 @dataclass
