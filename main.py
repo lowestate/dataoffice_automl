@@ -100,7 +100,7 @@ def _safe_filename(filename: str) -> str:
     return name[:100]  # обрезаем чтобы ключ вмещался в VARCHAR(200)
 
 
-def make_minio_key(user_id: int, filename: str) -> str:
+def make_minio_key(user_id: str, filename: str) -> str:
     """
     Формирует ключ MinIO: '{user_id}/{folder_name}/{filename}'.
     Где folder_name — это filename без расширения.
@@ -136,7 +136,7 @@ def run_automl(
     target: Optional[str],
     df: pd.DataFrame,
     cols_to_remove: list[str],
-    user_id: int,
+    user_id: str,
     plan_id: int = 3,
     progress_callback: Optional[Callable[[str, int], None]] = None,
     lencoder: Optional[Any] = None,
@@ -215,7 +215,7 @@ async def get_corr(
     НЕ создаёт запись training_result — это происходит только при /train.
     """
     logger.info(f"corr requested | user_id={user_id} filename={filename}")
-    uid = int(user_id) if user_id else 1
+    uid = user_id or "anonymous"
 
     df_raw = parse_from_b64(file_b64)
 
@@ -284,7 +284,7 @@ async def background_train_flow(
     task: str,
     target: Optional[str],
     cols_to_remove: list[str],
-    user_id: int,
+    user_id: str,
     files_minio_key: str,
     plan_id: int,
 ) -> None:
@@ -401,7 +401,7 @@ async def train(
       создаём новую запись в training_result, привязываем её к чату и очищаем кэш в Redis.
     - Запускаем background_train_flow в фоне и возвращаем chat_id немедленно.
     """
-    uid = int(user_id)
+    uid = user_id
     plan_id = await get_user_plan_id(uid)
 
     if task == "clustering" and plan_id == 1:
@@ -545,7 +545,7 @@ async def get_training_progress(training_id: int):
 
 
 @app.get("/history")
-async def get_history_endpoint(user_id: int) -> list:
+async def get_history_endpoint(user_id: str) -> list:
     return await get_history(user_id)
 
 
@@ -730,7 +730,7 @@ async def download_zip_endpoint(
 _MODEL_CACHE = {}
 
 @app.post("/predict/{model_id}")
-async def predict_endpoint(model_id: int, request_data: dict, user_id: Optional[int] = None) -> JSONResponse:
+async def predict_endpoint(model_id: int, request_data: dict, user_id: str | None = None) -> JSONResponse:
     """
     Принимает input данные для предсказания конкретной модели по model_id.
     Данные передаются как словарь {"data": [{...}, {...}]} или список [{...}] или просто {...}.
@@ -748,8 +748,8 @@ async def predict_endpoint(model_id: int, request_data: dict, user_id: Optional[
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT is_active, is_banned FROM users WHERE user_id = %s",
-                    (int(u_id),),
+                    "SELECT is_active, is_banned FROM users WHERE id::text = %s",
+                    (str(u_id),),
                 )
                 row = await cur.fetchone()
         

@@ -66,10 +66,10 @@ class RedisClient:
     # TTL = 15 минут. Один файл на юзера одновременно.
     # ------------------------------------------------------------------
 
-    def _user_dataset_key(self, user_id: int) -> str:
+    def _user_dataset_key(self, user_id: str) -> str:
         return f"dataset:user:{user_id}"
 
-    def set_user_dataset(self, user_id: int, minio_key: str, filename: str) -> None:
+    def set_user_dataset(self, user_id: str, minio_key: str, filename: str) -> None:
         """Сохраняет minio_key активного датасета юзера с TTL 15 минут.
         Перезаписывает предыдущее значение (один датасет на юзера)."""
         try:
@@ -79,7 +79,7 @@ class RedisClient:
         except Exception as e:
             logger.error(f"Ошибка set_user_dataset user_id={user_id}: {e}")
 
-    def get_user_dataset(self, user_id: int) -> Optional[dict]:
+    def get_user_dataset(self, user_id: str) -> Optional[dict]:
         """Возвращает {minio_key, filename} активного датасета юзера или None если TTL истёк."""
         try:
             raw = self.redis_client.get(self._user_dataset_key(user_id))
@@ -89,7 +89,7 @@ class RedisClient:
             logger.error(f"Ошибка get_user_dataset user_id={user_id}: {e}")
         return None
 
-    def delete_user_dataset(self, user_id: int) -> None:
+    def delete_user_dataset(self, user_id: str) -> None:
         """Удаляет запись активного датасета юзера из кэша после начала обучения."""
         try:
             self.redis_client.delete(self._user_dataset_key(user_id))

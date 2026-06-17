@@ -37,13 +37,51 @@ async def run_startup_migrations() -> None:
             """
             CREATE TABLE IF NOT EXISTS automl_chats (
                 chat_id VARCHAR(50) PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+                user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 dataset_name VARCHAR(255) NOT NULL,
                 files_minio_key VARCHAR(200) NOT NULL,
                 training_id INTEGER REFERENCES training_result(training_id) ON DELETE SET NULL,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
                 updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
             )
+            """
+        )
+
+        await conn.execute(
+            """
+            DO $$
+            DECLARE
+                constraint_name text;
+            BEGIN
+                IF EXISTS (
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = 'automl_chats' AND column_name = 'user_id' AND data_type <> 'uuid'
+                ) THEN
+                    FOR constraint_name IN
+                        SELECT conname
+                        FROM pg_constraint
+                        WHERE conrelid = 'automl_chats'::regclass AND contype = 'f'
+                    LOOP
+                        EXECUTE format('ALTER TABLE automl_chats DROP CONSTRAINT IF EXISTS %I', constraint_name);
+                    END LOOP;
+
+                    ALTER TABLE automl_chats ALTER COLUMN user_id TYPE UUID USING user_id::text::uuid;
+                END IF;
+            END $$;
+            """
+        )
+        await conn.execute(
+            """
+            DO $$
+            BEGIN
+                IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'automl_chats') THEN
+                    ALTER TABLE automl_chats
+                    ADD CONSTRAINT automl_chats_user_id_fkey
+                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+                END IF;
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END $$;
             """
         )
 
@@ -236,7 +274,7 @@ async def insert_training_x_model(*, training_id: int, model_id: int) -> int:
 
 
 
-async def get_history(user_id: int) -> list[dict]:
+async def get_history(user_id: str) -> list[dict]:
     """
     Возвращает историю обучений пользователя из таблицы automl_chats,
     объединенную с training_result для получения статуса и типа задачи.
@@ -326,7 +364,7 @@ async def delete_training_result(training_id: int) -> bool:
 async def insert_automl_chat(
     *,
     chat_id: str,
-    user_id: int,
+    user_id: str,
     dataset_name: str,
     files_minio_key: str,
 ) -> None:
@@ -396,7 +434,7 @@ async def delete_automl_chat(chat_id: str) -> bool:
     return row is not None
 
 
-async def delete_untrained_chats_by_user(user_id: int) -> None:
+async def delete_untrained_chats_by_user(user_id: str) -> None:
     """Удаляет все чаты пользователя, у которых обучение не начато (training_id IS NULL)."""
     async with pool.connection() as conn:
         await conn.execute(
@@ -520,7 +558,7 @@ async def get_model_by_id(model_id: int) -> Optional[dict]:
             }
 
 
-async def get_user_plan_id(user_id: int) -> int:
+async def get_user_plan_id(user_id: str) -> int:
     """
     Возвращает plan_id пользователя из таблицы users.
     По умолчанию возвращает 1 (junior).
@@ -528,10 +566,9 @@ async def get_user_plan_id(user_id: int) -> int:
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "SELECT plan_id FROM users WHERE user_id = %s",
-                (user_id,),
+                "SELECT plan_id FROM users WHERE id::text = %s",
+                (str(user_id),),
             )
             row = await cur.fetchone()
             return row[0] if row else 1
-
 
